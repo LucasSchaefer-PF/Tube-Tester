@@ -1,0 +1,454 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<title>Verificação de flexibilidade – tubo cortado a laser</title>
+<style>
+  body{margin:0;font-family:system-ui,Arial;display:flex;height:100vh;background:#1b1e23;color:#ddd}
+  #panel{width:340px;padding:12px;overflow:auto;background:#252a31;font-size:13px}
+  #view{flex:1;position:relative}
+  canvas{display:block}
+  h3{margin:12px 0 4px;font-size:14px;color:#8cc4ff}
+  label{display:flex;justify-content:space-between;align-items:center;margin:3px 0}
+  input,select{width:110px;background:#12151a;color:#eee;border:1px solid #444;padding:2px 4px}
+  input[type=range]{width:100%;padding:0}
+  button{margin-top:8px;padding:6px 10px;background:#2d6cdf;color:#fff;border:0;cursor:pointer}
+  button.s{margin:4px 4px 0 0;padding:3px 8px;background:#3a4350}
+  #res{white-space:pre;font-family:monospace;background:#12151a;padding:8px;margin-top:8px;line-height:1.5}
+  #status{margin-top:6px;color:#e8c46a;min-height:1.2em}
+  .ok{color:#6fdc8c}.bad{color:#ff6b6b}
+  small{color:#999}
+  .off{opacity:.4;pointer-events:none}
+</style>
+</head>
+<body>
+<div id="panel">
+  <h3>Geometria (mm) – desenho Rev. 0</h3>
+  <label>OD <input id="od" type="number" step="0.01" value="1.9"></label>
+  <label>ID <input id="id" type="number" step="0.01" value="1.4"></label>
+  <label>Comprimento <input id="L" type="number" step="1" value="250"></label>
+  <label>Passo <input id="pitch" type="number" step="0.01" value="1.25"></label>
+  <label>Kerf <input id="kerf" type="number" step="0.01" value="0.05"></label>
+  <label>Âng. corte (°) <input id="cut" type="number" value="90"></label>
+  <label>Âng. sem corte (°) <input id="unc" type="number" value="90"></label>
+  <label>Exagero visual kerf <input id="exag" type="number" value="5"></label>
+
+  <h3>Material (valores assumidos)</h3>
+  <label>E (MPa) <input id="E" type="number" value="193000"></label>
+  <label>σy (MPa) <input id="sy" type="number" value="215"></label>
+
+  <h3>Carregamento</h3>
+  <label>Modo
+    <select id="mode"><option value="F">Força (engaste em z=0)</option><option value="R">Raio de curvatura</option></select>
+  </label>
+  <label>Força F (N) <input id="F" type="number" step="0.001" value="0.05"></label>
+  <label>Raio R (mm) <input id="R" type="number" value="50"></label>
+
+  <div id="posBox">
+    <h3>Posição da força</h3>
+    <label>a (mm do engaste) <input id="a" type="number" step="0.5" value="250"></label>
+    <input id="aR" type="range" min="0" max="250" step="0.5" value="250">
+    <button class="s" id="bTip">Ponta</button><button class="s" id="bMid">Meio</button>
+    <br><small>Ou clique sobre o tubo na vista 3D (botão esquerdo, sem arrastar).</small>
+  </div>
+
+  <h3>Calibração</h3>
+  <label>η (0 = automático) <input id="eta" type="number" step="0.001" value="0"></label>
+  <label>Kε (concentração) <input id="Ke" type="number" step="0.1" value="1"></label>
+  <small>η = EI_efetivo / EI_tubo cheio. Ajuste com ensaio ou FEA.</small>
+
+  <h3>Modelo STEP</h3>
+  <input id="file" type="file" accept=".step,.stp" style="width:100%">
+  <label><span>Qualidade da malha</span>
+    <select id="qual"><option value="fast">Rápida</option><option value="normal" selected>Normal</option><option value="fine">Fina</option></select>
+  </label>
+  <label><span>Mostrar</span>
+    <select id="src"><option value="proc">Procedural</option><option value="step">STEP importado</option></select>
+  </label>
+  <div id="status"></div>
+  <button id="apply">Recalcular</button> <button id="fit">Enquadrar</button>
+  <div id="res"></div>
+  <small>Estimativa de 1ª ordem; não substitui FEA nem ensaio.</small>
+</div>
+<div id="view"></div>
+
+<script type="importmap">
+{"imports":{
+ "three":"https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+ "three/addons/":"https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"}}
+</script>
+<script src="https://cdn.jsdelivr.net/npm/occt-import-js@0.0.23/dist/occt-import-js.js"></script>
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+const $ = id => document.getElementById(id);
+const tick = () => new Promise(r => setTimeout(r, 30));
+const setStatus = t => { $('status').textContent = t; };
+const view = $('view');
+const OCCT_BASE = 'https://cdn.jsdelivr.net/npm/occt-import-js@0.0.23/dist/';
+
+/* ---------- Cena ---------- */
+const renderer = new THREE.WebGLRenderer({antialias:true});
+renderer.setPixelRatio(devicePixelRatio);
+view.appendChild(renderer.domElement);
+const cv = renderer.domElement;
+const scene = new THREE.Scene(); scene.background = new THREE.Color(0x1b1e23);
+const camera = new THREE.PerspectiveCamera(40,1,0.05,10000);
+const controls = new OrbitControls(camera, cv);
+controls.minDistance = 2;
+scene.add(new THREE.AmbientLight(0xffffff,0.7));
+const dl = new THREE.DirectionalLight(0xffffff,1.0); dl.position.set(1,2,3); scene.add(dl);
+const dl2 = new THREE.DirectionalLight(0xffffff,0.5); dl2.position.set(-1,-1,-2); scene.add(dl2);
+const grid = new THREE.GridHelper(600,60,0x444444,0x2a2a2a); grid.position.y=-8; scene.add(grid);
+const wall = new THREE.Mesh(new THREE.BoxGeometry(14,14,1), new THREE.MeshBasicMaterial({color:0x59606c}));
+wall.position.z = -0.5; scene.add(wall); // engaste em z = 0
+
+function resize(){ const w=view.clientWidth,h=view.clientHeight; renderer.setSize(w,h); camera.aspect=w/h; camera.updateProjectionMatrix(); }
+addEventListener('resize',resize); resize();
+
+const group = new THREE.Group(); scene.add(group);       // tubo: eixo = Z, flexão no plano X-Z
+const markerG = new THREE.Group(); group.add(markerG);   // seta + esfera da força
+const hover = new THREE.Mesh(new THREE.SphereGeometry(1,16,12),
+  new THREE.MeshBasicMaterial({color:0xffffff,transparent:true,opacity:0.6}));
+hover.visible=false; group.add(hover);
+
+function fitCamera(L){
+  camera.position.set(L*0.55, L*0.35, L*0.75);
+  controls.target.set(0,0,L/2); controls.update();
+}
+
+/* ---------- Estado e parâmetros ---------- */
+let stepBase=null, stepL=0, stepMesh=null, stepBuf=null, procMesh=null;
+const useStepNow = () => $('src').value==='step' && !!stepMesh;
+const curL = () => useStepNow() ? stepL : (parseFloat($('L').value)||250);
+
+function getP(){
+  const g = id => parseFloat($(id).value);
+  const useStep = useStepNow();
+  const L = curL();
+  const a = Math.min(Math.max(g('a')||0,0),L);
+  return {od:g('od'),id:g('id'),L,pitch:g('pitch'),kerf:g('kerf'),
+    cut:g('cut')*Math.PI/180,unc:g('unc')*Math.PI/180,exag:g('exag'),
+    E:g('E'),sy:g('sy'),mode:$('mode').value,R:g('R'),F:g('F'),a,
+    etaOv:g('eta'),Ke:g('Ke'),useStep};
+}
+function setA(v){
+  const L=curL(); v=Math.min(Math.max(v,0),L);
+  $('a').value=(+v.toFixed(2)); $('aR').max=L; $('aR').value=v;
+  scheduleUpdate();
+}
+
+/* ---------- Mecânica (estimativa de 1ª ordem) ---------- */
+function mech(p){
+  const Ro=p.od/2, Ri=p.id/2;
+  const I0=Math.PI/4*(Ro**4-Ri**4);
+  const frac=p.unc/(p.cut+p.unc);
+  const a=Math.max(2*Math.PI*frac,1e-3);   // setor remanescente equivalente
+  let eta;
+  if(p.etaOv>0) eta=p.etaOv;
+  else{
+    const A=a/2*(Ro**2-Ri**2);
+    const yc=4*Math.sin(a/2)/(3*a)*(Ro**3-Ri**3)/(Ro**2-Ri**2);
+    const Jo=a/4*(Ro**4-Ri**4);
+    eta=((Jo-A*yc*yc)/2)/I0;               // inércia média (Ix+Iy)/2 do setor
+  }
+  return {Ro,Ri,I0,eta,EI:p.E*I0*eta};
+}
+
+const N=800;
+let ds=1, CX=new Float64Array(N+1), CZ=new Float64Array(N+1), TH=new Float64Array(N+1), kmax=0;
+function buildCenterline(p,m){
+  ds=p.L/N; CX[0]=0;CZ[0]=0;TH[0]=0; kmax=0;
+  for(let i=0;i<N;i++){
+    const s=(i+0.5)*ds;
+    let k;
+    if(p.mode==='R') k=1/p.R;
+    else k = s<p.a ? p.F*(p.a-s)/m.EI : 0;   // M(s)=F(a-s) até o ponto de carga; depois reto
+    kmax=Math.max(kmax,Math.abs(k));
+    const th=TH[i]+k*ds*0.5;
+    TH[i+1]=TH[i]+k*ds;
+    CX[i+1]=CX[i]+Math.sin(th)*ds;
+    CZ[i+1]=CZ[i]+Math.cos(th)*ds;
+  }
+}
+const fr={cx:0,cz:0,th:0};
+function frame(s){
+  const f=Math.min(Math.max(s/ds,0),N-1e-9), i=f|0, t=f-i;
+  fr.cx=CX[i]+(CX[i+1]-CX[i])*t; fr.cz=CZ[i]+(CZ[i+1]-CZ[i])*t; fr.th=TH[i]+(TH[i+1]-TH[i])*t;
+  return fr;
+}
+
+/* ---------- Tubo procedural com fenda helicoidal (shader) ---------- */
+const vs=`attribute vec2 uvST; varying vec2 vU; varying vec3 vN;
+void main(){ vU=uvST; vN=normalMatrix*normal;
+ gl_Position=projectionMatrix*modelViewMatrix*vec4(position,1.0);}`;
+const fs=`precision highp float; varying vec2 vU; varying vec3 vN;
+uniform float pitch,kerf,cutA,uncA; uniform vec3 color;
+void main(){
+ float d=mod(vU.x-pitch*vU.y/6.2831853,pitch);
+ float dist=min(d,pitch-d);
+ float ang=mod(vU.y,cutA+uncA);
+ if(dist<kerf*0.5 && ang<cutA) discard;
+ vec3 n=normalize(vN);
+ float l=0.3+0.7*abs(dot(n,normalize(vec3(0.4,0.6,0.7))));
+ gl_FragColor=vec4(color*l,1.0);}`;
+
+function buildProcedural(p){
+  const nS=600,nT=64,pos=[],nor=[],uv=[],idx=[];
+  const Ro=p.od/2,Ri=p.id/2;
+  [[Ro,1],[Ri,-1]].forEach(([r,sg])=>{
+    const base=pos.length/3;
+    for(let i=0;i<=nS;i++){
+      const s=p.L*i/nS, f=frame(s), c=Math.cos(f.th), sn=Math.sin(f.th);
+      for(let j=0;j<=nT;j++){
+        const ph=2*Math.PI*j/nT, x=r*Math.cos(ph), y=r*Math.sin(ph);
+        pos.push(f.cx+x*c, y, f.cz-x*sn);
+        nor.push(sg*Math.cos(ph)*c, sg*Math.sin(ph), -sg*Math.cos(ph)*sn);
+        uv.push(s,ph);
+      }
+    }
+    for(let i=0;i<nS;i++)for(let j=0;j<nT;j++){
+      const a=base+i*(nT+1)+j,b=a+1,c2=a+nT+1,d=c2+1;
+      idx.push(a,b,c2,b,d,c2);
+    }
+  });
+  const g=new THREE.BufferGeometry();
+  g.setAttribute('position',new THREE.Float32BufferAttribute(pos,3));
+  g.setAttribute('normal',new THREE.Float32BufferAttribute(nor,3));
+  g.setAttribute('uvST',new THREE.Float32BufferAttribute(uv,2));
+  g.setIndex(idx);
+  const mat=new THREE.ShaderMaterial({vertexShader:vs,fragmentShader:fs,side:THREE.DoubleSide,
+    uniforms:{pitch:{value:p.pitch},kerf:{value:p.kerf*p.exag},cutA:{value:p.cut},uncA:{value:p.unc},
+              color:{value:new THREE.Color(0xb8c4d0)}}});
+  const mesh=new THREE.Mesh(g,mat); mesh.frustumCulled=false;
+  return mesh;
+}
+
+/* ---------- STEP: conversão em Web Worker (com fallback) ---------- */
+const QUAL={ fast:{lin:0.02,ang:0.6,dz:4}, normal:{lin:0.01,ang:0.4,dz:2}, fine:{lin:0.005,ang:0.25,dz:1} };
+const workerSrc=`
+self.onmessage=async e=>{
+  try{
+    importScripts('${OCCT_BASE}occt-import-js.js');
+    const occt=await occtimportjs({locateFile:n=>'${OCCT_BASE}'+n});
+    const r=occt.ReadStepFile(new Uint8Array(e.data.buf),e.data.opts);
+    if(!r.success){self.postMessage({ok:false,err:'Falha ao ler o STEP'});return;}
+    const meshes=[],tr=[];
+    for(const m of r.meshes){
+      const p=new Float32Array(m.attributes.position.array);
+      const i=new Uint32Array(m.index.array);
+      meshes.push({p,i}); tr.push(p.buffer,i.buffer);
+    }
+    self.postMessage({ok:true,meshes},tr);
+  }catch(err){self.postMessage({ok:false,err:String(err&&err.message||err)});}
+};`;
+function convertWorker(buf,opts){
+  return new Promise((res,rej)=>{
+    let w;
+    try{ w=new Worker(URL.createObjectURL(new Blob([workerSrc],{type:'text/javascript'}))); }
+    catch(e){ rej(e); return; }
+    w.onmessage=e=>{ w.terminate(); e.data.ok?res(e.data.meshes):rej(new Error(e.data.err)); };
+    w.onerror=e=>{ w.terminate(); rej(new Error('Worker falhou')); };
+    w.postMessage({buf,opts},[buf]);
+  });
+}
+async function convertMain(buf,opts){
+  const occt=await occtimportjs({locateFile:n=>OCCT_BASE+n});
+  const r=occt.ReadStepFile(new Uint8Array(buf),opts);
+  if(!r.success) throw new Error('Falha ao ler o STEP');
+  return r.meshes.map(m=>({p:new Float32Array(m.attributes.position.array),i:new Uint32Array(m.index.array)}));
+}
+async function convert(buf,opts){
+  try{ return await convertWorker(buf.slice(0),opts); }
+  catch(e){
+    setStatus('Worker indisponível; convertendo na thread principal (pode congelar)...'); await tick();
+    return await convertMain(buf.slice(0),opts);
+  }
+}
+
+/* Refinamento: divide apenas a aresta de maior extensão em Z */
+function refine(P,maxDz,limitTris){
+  const n=P.length/9;
+  const out=new Float32Array((limitTris+n+64)*9); let o=0;
+  const put=(a,b,c,d,e,f,g,h,i)=>{ out[o++]=a;out[o++]=b;out[o++]=c;out[o++]=d;out[o++]=e;out[o++]=f;out[o++]=g;out[o++]=h;out[o++]=i; };
+  const rec=(x0,y0,z0,x1,y1,z1,x2,y2,z2,d)=>{
+    const d01=Math.abs(z1-z0), d12=Math.abs(z2-z1), d20=Math.abs(z0-z2);
+    const m=Math.max(d01,d12,d20);
+    if(m>maxDz && d<24 && o/9<limitTris){
+      if(m===d01){
+        const mx=(x0+x1)/2,my=(y0+y1)/2,mz=(z0+z1)/2;
+        rec(x0,y0,z0,mx,my,mz,x2,y2,z2,d+1); rec(mx,my,mz,x1,y1,z1,x2,y2,z2,d+1);
+      }else if(m===d12){
+        const mx=(x1+x2)/2,my=(y1+y2)/2,mz=(z1+z2)/2;
+        rec(x0,y0,z0,x1,y1,z1,mx,my,mz,d+1); rec(x0,y0,z0,mx,my,mz,x2,y2,z2,d+1);
+      }else{
+        const mx=(x2+x0)/2,my=(y2+y0)/2,mz=(z2+z0)/2;
+        rec(x0,y0,z0,x1,y1,z1,mx,my,mz,d+1); rec(mx,my,mz,x1,y1,z1,x2,y2,z2,d+1);
+      }
+    }else put(x0,y0,z0,x1,y1,z1,x2,y2,z2);
+  };
+  for(let i=0;i<P.length;i+=9)
+    rec(P[i],P[i+1],P[i+2],P[i+3],P[i+4],P[i+5],P[i+6],P[i+7],P[i+8],0);
+  return out.slice(0,o);
+}
+
+async function importStep(buf){
+  const q=QUAL[$('qual').value];
+  setStatus('Convertendo STEP (aguarde)...'); await tick();
+  const meshes=await convert(buf,{linearUnit:'millimeter',linearDeflectionType:'absolute_value',
+                                  linearDeflection:q.lin,angularDeflection:q.ang});
+  let nIdx=0; for(const m of meshes) nIdx+=m.i.length;
+  if(nIdx/3>2e6) throw new Error('Malha com '+Math.round(nIdx/3)+' triângulos (limite 2 milhões). Use qualidade "Rápida".');
+  setStatus('Montando malha...'); await tick();
+  const raw=new Float32Array(nIdx*3); let o=0;
+  for(const m of meshes){
+    for(let i=0;i<m.i.length;i++){ const k=m.i[i]*3; raw[o++]=m.p[k]; raw[o++]=m.p[k+1]; raw[o++]=m.p[k+2]; }
+  }
+  const mn=[Infinity,Infinity,Infinity], mx=[-Infinity,-Infinity,-Infinity];
+  for(let i=0;i<raw.length;i+=3)for(let k=0;k<3;k++){const v=raw[i+k]; if(v<mn[k])mn[k]=v; if(v>mx[k])mx[k]=v;}
+  const dim=mx.map((v,k)=>v-mn[k]);
+  const ax=dim.indexOf(Math.max(...dim)), o1=(ax+1)%3, o2=(ax+2)%3;
+  const c1=(mn[o1]+mx[o1])/2, c2=(mn[o2]+mx[o2])/2;
+  let rmax=0,rmin=Infinity;
+  for(let i=0;i<raw.length;i+=3){                // eixo -> z; centra xy; z mín = 0
+    const x=raw[i+o1]-c1, y=raw[i+o2]-c2, z=raw[i+ax]-mn[ax];
+    raw[i]=x; raw[i+1]=y; raw[i+2]=z;
+    const r=Math.hypot(x,y); if(r>rmax)rmax=r; if(r<rmin)rmin=r;
+  }
+  setStatus('Refinando malha...'); await tick();
+  const P=refine(raw,q.dz,700000);
+  if(stepMesh){ group.remove(stepMesh); stepMesh.geometry.dispose(); stepMesh.material.dispose(); }
+  stepBase=P; stepL=dim[ax];
+  const g=new THREE.BufferGeometry();
+  const attr=new THREE.BufferAttribute(new Float32Array(P.length),3); attr.setUsage(THREE.DynamicDrawUsage);
+  g.setAttribute('position',attr);
+  stepMesh=new THREE.Mesh(g,new THREE.MeshStandardMaterial({color:0xb8c4d0,metalness:0.5,roughness:0.45,
+                          side:THREE.DoubleSide,flatShading:true}));
+  stepMesh.frustumCulled=false; stepMesh.visible=false; group.add(stepMesh);
+  $('L').value=stepL.toFixed(2); $('od').value=(2*rmax).toFixed(3); $('id').value=(2*rmin).toFixed(3);
+  $('src').value='step'; $('a').value=stepL.toFixed(2);
+  $('aR').max=stepL; $('aR').value=stepL;
+  setStatus('STEP: '+(P.length/9)+' triângulos; L='+stepL.toFixed(2)+' mm. OD/ID estimados (confira).');
+  fitCamera(stepL); update();
+}
+$('file').addEventListener('change',async e=>{
+  const f=e.target.files[0]; if(!f) return;
+  try{ stepBuf=await f.arrayBuffer(); await importStep(stepBuf); }
+  catch(err){ setStatus('Erro STEP: '+err.message); }
+});
+$('qual').addEventListener('change',async()=>{
+  if(!stepBuf) return;
+  try{ await importStep(stepBuf); }catch(err){ setStatus('Erro STEP: '+err.message); }
+});
+
+function deformStep(){
+  const P=stepBase, O=stepMesh.geometry.attributes.position.array, Lm=stepL;
+  for(let i=0;i<P.length;i+=3){
+    const x=P[i], f=frame(Math.min(P[i+2],Lm)), c=Math.cos(f.th), sn=Math.sin(f.th);
+    O[i]=f.cx+x*c; O[i+1]=P[i+1]; O[i+2]=f.cz-x*sn;
+  }
+  stepMesh.geometry.attributes.position.needsUpdate=true;
+}
+
+/* ---------- Marcadores de força ---------- */
+function updateMarkers(p,m){
+  while(markerG.children.length){ const o=markerG.children.pop(); if(o.geometry)o.geometry.dispose(); if(o.material)o.material.dispose(); }
+  hover.scale.setScalar(Math.max(m.Ro*1.8,0.6));
+  if(p.mode!=='F') return;
+  const f=frame(p.a), P=new THREE.Vector3(f.cx,0,f.cz);
+  const ball=new THREE.Mesh(new THREE.SphereGeometry(Math.max(m.Ro*1.8,0.6),16,12),new THREE.MeshBasicMaterial({color:0xffd33d}));
+  ball.position.copy(P); markerG.add(ball);
+  const len=Math.max(p.L*0.08,6), dir=new THREE.Vector3(p.F>=0?1:-1,0,0);
+  const arrow=new THREE.ArrowHelper(dir,P.clone().addScaledVector(dir,-len),len,0xff4040,len*0.3,len*0.15);
+  markerG.add(arrow);
+}
+
+/* ---------- Atualização e resultados ---------- */
+let pending=false;
+function scheduleUpdate(){ if(pending) return; pending=true; requestAnimationFrame(()=>{pending=false;update();}); }
+
+function update(){
+  const p=getP(), m=mech(p);
+  $('posBox').classList.toggle('off',p.mode!=='F');
+  buildCenterline(p,m);
+  if(procMesh){ group.remove(procMesh); procMesh.geometry.dispose(); procMesh.material.dispose(); procMesh=null; }
+  if(stepMesh) stepMesh.visible=p.useStep;
+  if(p.useStep) deformStep();
+  else { procMesh=buildProcedural(p); group.add(procMesh); }
+  updateMarkers(p,m);
+
+  const eps=kmax*m.Ro*p.Ke, sig=p.E*eps, SF=eps>0?p.sy/sig:Infinity;
+  const Rmin=m.Ro*p.Ke*p.E/p.sy;
+  const Mlim=m.EI*p.sy/(p.E*m.Ro*p.Ke);          // N·mm que leva ao escoamento
+  const Flim=(p.mode==='F'&&p.a>0)?Mlim/p.a:NaN;
+  const iA=Math.min(Math.round(p.a/ds),N);
+  const cls=SF>=1?'ok':'bad';
+  const M0=p.mode==='F'?p.F*p.a:kmax*m.EI;
+  $('res').innerHTML=
+`η usado           : ${m.eta.toFixed(4)}
+EI efetivo        : ${m.EI.toExponential(3)} N·mm²
+Momento no engaste: ${M0.toExponential(3)} N·mm
+κ máx             : ${kmax.toExponential(3)} 1/mm${kmax>0?' (R='+(1/kmax).toFixed(1)+' mm)':''}
+Defl. na força    : ${p.mode==='F'?CX[iA].toFixed(2)+' mm (a='+p.a.toFixed(1)+')':'—'}
+Defl. da ponta    : ${CX[N].toFixed(2)} mm
+Ângulo da ponta   : ${(TH[N]*180/Math.PI).toFixed(1)}°
+ε máx (×Kε)       : ${(eps*100).toFixed(3)} %
+σ equiv. flexão   : ${sig.toFixed(0)} MPa
+Coef. segurança   : <span class="${cls}">${isFinite(SF)?SF.toFixed(2):'∞'} ${SF>=1?'OK':'ESCOA'}</span>
+R mín (σy)        : ${Rmin.toFixed(1)} mm
+F limite (em a)   : ${isNaN(Flim)?'—':Flim.toExponential(3)+' N'}`;
+}
+
+/* ---------- Interação: escolha da posição pelo clique ---------- */
+const tmp=new THREE.Vector3();
+function nearest(ev){
+  const r=cv.getBoundingClientRect(), mx=ev.clientX-r.left, my=ev.clientY-r.top;
+  let best=null,bd=1e9;
+  for(let i=0;i<=N;i+=2){
+    tmp.set(CX[i],0,CZ[i]).project(camera);
+    if(tmp.z>1) continue;
+    const sx=(tmp.x*0.5+0.5)*r.width, sy=(-tmp.y*0.5+0.5)*r.height;
+    const d=Math.hypot(sx-mx,sy-my);
+    if(d<bd){bd=d;best=i;}
+  }
+  return (best!==null&&bd<=40)?{s:best*ds,i:best}:null;
+}
+let down=null;
+cv.addEventListener('pointerdown',e=>{ down={x:e.clientX,y:e.clientY,b:e.button}; });
+cv.addEventListener('pointerup',e=>{
+  if(!down||down.b!==0||$('mode').value!=='F'){down=null;return;}
+  const moved=Math.hypot(e.clientX-down.x,e.clientY-down.y); down=null;
+  if(moved>5) return;
+  const h=nearest(e); if(h) setA(h.s);
+});
+cv.addEventListener('pointermove',e=>{
+  if($('mode').value!=='F'||e.buttons!==0){hover.visible=false;return;}
+  const h=nearest(e);
+  if(h){ hover.position.set(CX[h.i],0,CZ[h.i]); hover.visible=true; } else hover.visible=false;
+});
+cv.addEventListener('pointerleave',()=>{hover.visible=false;});
+
+/* ---------- Ligações da interface ---------- */
+for(const id of ['od','id','pitch','kerf','cut','unc','exag','E','sy','F','R','eta','Ke'])
+  $(id).addEventListener('input',scheduleUpdate);
+$('mode').addEventListener('change',scheduleUpdate);
+$('L').addEventListener('input',()=>{ $('aR').max=curL(); fitCamera(curL()); scheduleUpdate(); });
+$('a').addEventListener('input',()=>{ $('aR').value=$('a').value; scheduleUpdate(); });
+$('aR').addEventListener('input',()=>setA(parseFloat($('aR').value)));
+$('bTip').onclick=()=>setA(curL());
+$('bMid').onclick=()=>setA(curL()/2);
+$('src').addEventListener('change',()=>{
+  if($('src').value==='step'&&!stepMesh){ $('src').value='proc'; setStatus('Importe um STEP primeiro.'); return; }
+  $('aR').max=curL(); fitCamera(curL()); setA(curL());
+});
+$('apply').onclick=update;
+$('fit').onclick=()=>fitCamera(curL());
+
+/* ---------- Início ---------- */
+fitCamera(curL());
+update();
+(function loop(){ requestAnimationFrame(loop); controls.update(); renderer.render(scene,camera); })();
+</script>
+</body>
+</html>
